@@ -1,0 +1,1684 @@
+from aiogram.client.default import DefaultBotProperties
+import asyncio
+import logging
+import random
+import html as html_module
+import json
+from typing import Optional
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.enums import ParseMode, ContentType
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InputMediaPhoto,
+    InputMediaAnimation,
+)
+
+# ===================== НАСТРОЙКИ =====================
+
+API_TOKEN = ''
+ADMIN_IDS = {1056843400, 5002429263}
+SUPPORT_USERNAME = "@hekomar"
+DB_PATH = "dating_bot.db"
+
+HIDE_MATCHED_PROFILES = True
+
+# ===================== PREMIUM EMOJI IDS =====================
+
+EMOJI_SETTINGS = "5870982283724328568"
+EMOJI_PROFILE = "5870994129244131212"
+EMOJI_PEOPLE = "5870772616305839506"
+EMOJI_CHECK = "5870633910337015697"
+EMOJI_CROSS = "5870657884844462243"
+EMOJI_PENCIL = "5870676941614354370"
+EMOJI_HEART = "5963103826075456248"
+EMOJI_INFO = "6028435952299413210"
+EMOJI_BOT = "6030400221232501136"
+EMOJI_BELL = "6039486778597970865"
+EMOJI_PARTY = "6041731551845159060"
+EMOJI_STATS = "5870921681735781843"
+EMOJI_MEGAPHONE = "6039422865189638057"
+EMOJI_LOCK = "6037249452824072506"
+EMOJI_UNLOCK = "6037496202990194718"
+EMOJI_TRASH = "5870875489362513438"
+EMOJI_MEDIA = "6035128606563241721"
+EMOJI_BACK = "5345906554510012647"
+EMOJI_SMILE = "5870764288364252592"
+EMOJI_EYE = "6037397706505195857"
+EMOJI_HIDDEN = "6037243349675544634"
+EMOJI_GIFT = "6032644646587338669"
+EMOJI_SEND = "5963103826075456248"
+EMOJI_DOWNLOAD = "6039802767931871481"
+
+# ===================== LOGGING =====================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ===================== BOT & DISPATCHER =====================
+
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+# ===================== FSM STATES =====================
+
+
+class ProfileForm(StatesGroup):
+    photo = State()
+    name = State()
+    age = State()
+    faculty = State()
+    about = State()
+    gender = State()
+    looking_for = State()
+
+
+class EditPhotoForm(StatesGroup):
+    waiting_photo = State()
+
+
+class EditTextForm(StatesGroup):
+    waiting_text = State()
+
+
+class BroadcastForm(StatesGroup):
+    waiting_message = State()
+
+
+class BlacklistForm(StatesGroup):
+    waiting_id = State()
+
+
+# ===================== IN-MEMORY STORES =====================
+
+current_targets: dict[int, int] = {}
+user_queues: dict[int, list[int]] = {}
+
+# ===================== DATABASE =====================
+
+
+async def get_db() -> aiosqlite.Connection:
+    db = await aiosqlite.connect(DB_PATH, timeout=10.0)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    return db
+
+
+async def init_db():
+    db = await get_db()
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER UNIQUE,
+            tg_username TEXT,
+            username TEXT,
+            photo_file_id TEXT,
+            gender TEXT,
+            age INTEGER,
+            faculty TEXT,
+            about TEXT,
+            is_active INTEGER DEFAULT 1,
+            looking_for TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS swipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            viewer_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            is_like INTEGER NOT NULL DEFAULT 0,
+            viewed_in_incoming INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_a_id INTEGER NOT NULL,
+            user_b_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_a_id, user_b_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER UNIQUE NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+    row = await db.execute_fetchall("SELECT value FROM settings WHERE key='hide_matched'")
+    if not row:
+        await db.execute("INSERT INTO settings (key, value) VALUES ('hide_matched', '1')")
+    await db.commit()
+    await db.close()
+
+
+async def is_blacklisted(tg_id: int) -> bool:
+    db = await get_db()
+    row = await db.execute_fetchall("SELECT 1 FROM blacklist WHERE tg_id=?", (tg_id,))
+    await db.close()
+    return len(row) > 0
+
+
+async def add_to_blacklist(tg_id: int):
+    db = await get_db()
+    await db.execute("INSERT OR IGNORE INTO blacklist (tg_id) VALUES (?)", (tg_id,))
+    await db.commit()
+    await db.close()
+
+
+async def remove_from_blacklist(tg_id: int):
+    db = await get_db()
+    await db.execute("DELETE FROM blacklist WHERE tg_id=?", (tg_id,))
+    await db.commit()
+    await db.close()
+
+
+async def get_setting(key: str) -> Optional[str]:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT value FROM settings WHERE key=?", (key,))
+    await db.close()
+    return rows[0][0] if rows else None
+
+
+async def set_setting(key: str, value: str):
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    await db.commit()
+    await db.close()
+
+
+async def get_hide_matched() -> bool:
+    val = await get_setting("hide_matched")
+    return val == "1"
+
+
+async def save_or_update_username(tg_id: int, tg_username: Optional[str]):
+    db = await get_db()
+    await db.execute(
+        """
+        INSERT INTO users (tg_id, tg_username)
+        VALUES (?, ?)
+        ON CONFLICT(tg_id) DO UPDATE SET tg_username=excluded.tg_username
+        """,
+        (tg_id, tg_username),
+    )
+    await db.commit()
+    await db.close()
+
+
+async def upsert_profile(
+    tg_id: int,
+    username: str,
+    tg_username: Optional[str],
+    photo_file_id: str,
+    gender: str,
+    age: int,
+    faculty: Optional[str],
+    about: str,
+    is_active: int,
+    looking_for: str,
+):
+    db = await get_db()
+    row = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (tg_id,))
+    if row:
+        await db.execute(
+            """
+            UPDATE users SET
+                username=?, tg_username=?, photo_file_id=?, gender=?,
+                age=?, faculty=?, about=?, is_active=?, looking_for=?,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE tg_id=?
+            """,
+            (username, tg_username, photo_file_id, gender, age, faculty, about, is_active, looking_for, tg_id),
+        )
+    else:
+        await db.execute(
+            """
+            INSERT INTO users (tg_id, tg_username, username, photo_file_id, gender, age, faculty, about, is_active, looking_for)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (tg_id, tg_username, username, photo_file_id, gender, age, faculty, about, is_active, looking_for),
+        )
+    await db.commit()
+    await db.close()
+
+
+async def get_user_by_tg_id(tg_id: int) -> Optional[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM users WHERE tg_id=?", (tg_id,))
+    await db.close()
+    if rows:
+        return dict(rows[0])
+    return None
+
+
+async def get_user_db_id(tg_id: int) -> Optional[int]:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (tg_id,))
+    await db.close()
+    return rows[0][0] if rows else None
+
+
+async def set_user_active(tg_id: int, is_active: int):
+    db = await get_db()
+    await db.execute("UPDATE users SET is_active=? WHERE tg_id=?", (is_active, tg_id))
+    await db.commit()
+    await db.close()
+
+
+async def update_user_photo(tg_id: int, photo_file_id: str):
+    db = await get_db()
+    await db.execute(
+        "UPDATE users SET photo_file_id=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?",
+        (photo_file_id, tg_id),
+    )
+    await db.commit()
+    await db.close()
+
+
+async def update_user_about(tg_id: int, about: str):
+    db = await get_db()
+    await db.execute(
+        "UPDATE users SET about=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?",
+        (about, tg_id),
+    )
+    await db.commit()
+    await db.close()
+
+
+async def has_profile(tg_id: int) -> bool:
+    user = await get_user_by_tg_id(tg_id)
+    if not user:
+        return False
+    return user.get("username") is not None and user.get("photo_file_id") is not None
+
+
+async def get_candidate_ids(viewer_db_id: int) -> list[int]:
+    db = await get_db()
+    viewer_rows = await db.execute_fetchall("SELECT gender, looking_for FROM users WHERE id=?", (viewer_db_id,))
+    if not viewer_rows:
+        await db.close()
+        return []
+
+    viewer = dict(viewer_rows[0])
+    looking_for = viewer.get("looking_for") or "all"
+
+    gender_clause = ""
+    if looking_for == "m":
+        gender_clause = "AND u.gender='m'"
+    elif looking_for == "f":
+        gender_clause = "AND u.gender='f'"
+
+    hide_matched = await get_hide_matched()
+    match_clause = ""
+    if hide_matched:
+        match_clause = f"""
+            AND u.id NOT IN (
+                SELECT user_b_id FROM matches WHERE user_a_id={viewer_db_id}
+                UNION
+                SELECT user_a_id FROM matches WHERE user_b_id={viewer_db_id}
+            )
+        """
+
+    query = f"""
+        SELECT u.id FROM users u
+        WHERE u.id != ?
+          AND u.is_active = 1
+          AND u.username IS NOT NULL
+          AND u.photo_file_id IS NOT NULL
+          AND u.tg_id NOT IN (SELECT tg_id FROM blacklist)
+          {gender_clause}
+          {match_clause}
+    """
+    rows = await db.execute_fetchall(query, (viewer_db_id,))
+    await db.close()
+    return [r[0] for r in rows]
+
+
+async def get_next_profile_for_view(viewer_tg_id: int) -> Optional[dict]:
+    viewer_db_id = await get_user_db_id(viewer_tg_id)
+    if viewer_db_id is None:
+        return None
+
+    q = user_queues.get(viewer_db_id)
+    if not q:
+        candidates = await get_candidate_ids(viewer_db_id)
+        if not candidates:
+            return None
+        random.shuffle(candidates)
+        q = candidates
+        user_queues[viewer_db_id] = q
+
+    if not q:
+        return None
+
+    target_db_id = q.pop(0)
+    user_queues[viewer_db_id] = q
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT id, tg_id, username, age, gender, looking_for, faculty, about, photo_file_id
+        FROM users WHERE id=?
+        """,
+        (target_db_id,),
+    )
+    await db.close()
+
+    if not rows:
+        return await get_next_profile_for_view(viewer_tg_id)
+
+    return dict(rows[0])
+
+
+async def get_incoming_likes_count(viewer_tg_id: int) -> int:
+    viewer_db_id = await get_user_db_id(viewer_tg_id)
+    if viewer_db_id is None:
+        return 0
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT COUNT(*) FROM swipes
+        WHERE target_id=? AND is_like=1 AND viewed_in_incoming=0
+        """,
+        (viewer_db_id,),
+    )
+    await db.close()
+    return rows[0][0] if rows else 0
+
+
+async def get_one_incoming_like_profile(viewer_tg_id: int) -> Optional[dict]:
+    viewer_db_id = await get_user_db_id(viewer_tg_id)
+    if viewer_db_id is None:
+        return None
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT s.id as swipe_id, u.tg_id, u.username, u.age, u.faculty, u.about, u.photo_file_id
+        FROM swipes s
+        JOIN users u ON u.id = s.viewer_id
+        WHERE s.target_id=? AND s.is_like=1 AND s.viewed_in_incoming=0
+        ORDER BY s.created_at ASC
+        LIMIT 1
+        """,
+        (viewer_db_id,),
+    )
+
+    if not rows:
+        await db.close()
+        return None
+
+    row = dict(rows[0])
+    swipe_id = row["swipe_id"]
+    await db.execute("UPDATE swipes SET viewed_in_incoming=1 WHERE id=?", (swipe_id,))
+    await db.commit()
+    await db.close()
+
+    return row
+
+
+async def add_like(viewer_tg_id: int, target_tg_id: int) -> bool:
+    db = await get_db()
+    v_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (viewer_tg_id,))
+    t_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (target_tg_id,))
+    if not v_rows or not t_rows:
+        await db.close()
+        return False
+
+    viewer_id = v_rows[0][0]
+    target_id = t_rows[0][0]
+
+    existing = await db.execute_fetchall(
+        "SELECT 1 FROM swipes WHERE viewer_id=? AND target_id=? AND is_like=1",
+        (viewer_id, target_id),
+    )
+    if not existing:
+        await db.execute(
+            "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES (?, ?, 1)",
+            (viewer_id, target_id),
+        )
+        await db.commit()
+
+    mutual_rows = await db.execute_fetchall(
+        "SELECT 1 FROM swipes WHERE viewer_id=? AND target_id=? AND is_like=1 LIMIT 1",
+        (target_id, viewer_id),
+    )
+    mutual = len(mutual_rows) > 0
+
+    if mutual:
+        a, b = min(viewer_id, target_id), max(viewer_id, target_id)
+        # Проверяем, был ли уже мэтч (чтобы не дублировать уведомления)
+        existing_match = await db.execute_fetchall(
+            "SELECT 1 FROM matches WHERE user_a_id=? AND user_b_id=?",
+            (a, b),
+        )
+        if existing_match:
+            # Мэтч уже был — не уведомляем повторно
+            await db.close()
+            return False
+        await db.execute(
+            "INSERT OR IGNORE INTO matches (user_a_id, user_b_id) VALUES (?, ?)",
+            (a, b),
+        )
+        await db.commit()
+
+    await db.close()
+    return mutual
+
+
+async def add_dislike(viewer_tg_id: int, target_tg_id: int):
+    db = await get_db()
+    v_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (viewer_tg_id,))
+    t_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (target_tg_id,))
+    if not v_rows or not t_rows:
+        await db.close()
+        return
+    await db.execute(
+        "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES (?, ?, 0)",
+        (v_rows[0][0], t_rows[0][0]),
+    )
+    await db.commit()
+    await db.close()
+
+
+async def get_total_likes_for_user(tg_id: int) -> int:
+    db_id = await get_user_db_id(tg_id)
+    if db_id is None:
+        return 0
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(DISTINCT viewer_id) FROM swipes WHERE target_id=? AND is_like=1",
+        (db_id,),
+    )
+    await db.close()
+    return rows[0][0] if rows else 0
+
+
+async def get_top_profiles(limit: int = 10) -> list[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        SELECT u.id, u.tg_id, u.username, u.age, u.faculty,
+               COUNT(DISTINCT s.viewer_id) as likes_count
+        FROM users u
+        LEFT JOIN swipes s ON s.target_id=u.id AND s.is_like=1
+        WHERE u.username IS NOT NULL
+        GROUP BY u.id
+        ORDER BY likes_count DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    await db.close()
+    return [dict(r) for r in rows]
+
+
+async def get_all_user_tg_ids() -> list[int]:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT tg_id FROM users WHERE tg_id IS NOT NULL")
+    await db.close()
+    return [r[0] for r in rows]
+
+
+# ===================== KEYBOARDS =====================
+
+
+def main_menu_kb(has_profile_flag: bool = True) -> dict:
+    if has_profile_flag:
+        keyboard = {
+            "keyboard": [
+                [{"text": "1"}, {"text": "2"}, {"text": "3"}, {"text": "4"}],
+            ],
+            "resize_keyboard": True,
+        }
+    else:
+        keyboard = {
+            "keyboard": [
+                [{"text": "1"}, {"text": "4"}],
+            ],
+            "resize_keyboard": True,
+        }
+    return keyboard
+
+
+def my_profile_menu_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "📋 Смотреть анкеты"}, {"text": "🔄 Заполнить заново"}],
+            [{"text": "🖼 Изменить фото"}, {"text": "✏️ Изменить текст"}],
+            [{"text": "🔙 Главное меню"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def browse_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "❤️"}, {"text": "👎"}, {"text": "💤"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def incoming_like_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "❤️"}, {"text": "👎"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def view_likes_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "Посмотреть"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def gender_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "Парень"}],
+            [{"text": "Девушка"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def looking_for_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "Парня"}],
+            [{"text": "Девушку"}],
+            [{"text": "Всех"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def admin_menu_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "Топ-10 анкет"}],
+            [{"text": "Чёрный список"}],
+            [{"text": "Рассылка"}],
+            [{"text": "Тумблер мэтча"}],
+            [{"text": "Выйти из админки"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+def blacklist_menu_kb() -> dict:
+    return {
+        "keyboard": [
+            [{"text": "Добавить в ЧС"}],
+            [{"text": "Убрать из ЧС"}],
+            [{"text": "Назад в админку"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+
+async def send_with_custom_kb(chat_id: int, text: str, keyboard_dict: dict, **kwargs):
+    import aiohttp
+
+    url = f"https://api.telegram.org/bot{API_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard_dict),
+    }
+    payload.update(kwargs)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            result = await resp.json()
+            return result
+
+
+async def send_photo_with_custom_kb(chat_id: int, photo: str, caption: str, keyboard_dict: dict):
+    import aiohttp
+
+    url = f"https://api.telegram.org/bot{API_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard_dict),
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            return await resp.json()
+
+
+# ===================== HELPERS =====================
+
+
+def get_clickable_username(user: dict) -> str:
+    tg_username = user.get("tg_username")
+    tg_id = user.get("tg_id")
+    if tg_username:
+        tg_username = tg_username.lstrip("@")
+        safe = html_module.escape(tg_username)
+        return f'<a href="https://t.me/{safe}">@{safe}</a>'
+    return f'<a href="tg://user?id={tg_id}">профиль</a>'
+
+
+def format_profile_text(user: dict, show_status: bool = False) -> str:
+    username = user.get("username", "—")
+    age = user.get("age", "?")
+    faculty = user.get("faculty")
+    about = user.get("about", "")
+
+    text = f"<b>{html_module.escape(str(username))}</b>, {age}\n"
+
+    if faculty:
+        text += f"Факультет: {html_module.escape(str(faculty))}\n"
+
+    text += f"\n{html_module.escape(str(about))}"
+
+    if show_status:
+        is_active = user.get("is_active", 1)
+        gender = user.get("gender", "?")
+        looking_for = user.get("looking_for", "all")
+
+        gender_text = "Парень" if gender == "m" else "Девушка" if gender == "f" else "?"
+        lf_text = "Парней" if looking_for == "m" else "Девушек" if looking_for == "f" else "Всех"
+
+        text += f"\n\nПол: {gender_text}"
+        text += f"\nИщу: {lf_text}"
+
+        if is_active == 1:
+            text += f"\nСтатус: ✅ активна"
+        else:
+            text += f"\nСтатус: ❌ неактивна"
+
+        text += f"\n\n🟢 Включить анкету — /activate"
+        text += f"\n🔴 Выключить анкету — /deactivate"
+
+    return text
+
+
+async def send_profile_card(chat_id: int, user: dict, keyboard_dict: dict, show_status: bool = False):
+    text = format_profile_text(user, show_status=show_status)
+    photo_id = user.get("photo_file_id")
+
+    if photo_id:
+        await send_photo_with_custom_kb(chat_id, photo_id, text, keyboard_dict)
+    else:
+        await send_with_custom_kb(chat_id, text, keyboard_dict)
+
+
+def main_menu_text(has_profile_flag: bool = True) -> str:
+    if has_profile_flag:
+        return (
+            "📋 <b>Меню:</b>\n\n"
+            "1. Заполнить анкету\n"
+            "2. Смотреть анкеты\n"
+            "3. Моя анкета\n"
+            "4. Поддержка"
+        )
+    else:
+        return (
+            "📋 <b>Меню:</b>\n\n"
+            "1. Заполнить анкету\n"
+            "4. Поддержка"
+        )
+
+
+async def show_main_menu(message: Message):
+    tg_id = message.from_user.id
+    hp = await has_profile(tg_id)
+    text = main_menu_text(hp)
+    await send_with_custom_kb(message.chat.id, text, main_menu_kb(hp))
+
+
+# ===================== BLACKLIST CHECK =====================
+
+
+async def check_blacklist(message: Message) -> bool:
+    if await is_blacklisted(message.from_user.id):
+        await message.answer("🔒 <b>Вы в чёрном списке.</b>")
+        return True
+    return False
+
+
+# ===================== /start =====================
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    tg_id = message.from_user.id
+    tg_username = message.from_user.username
+
+    if await is_blacklisted(tg_id):
+        await message.answer("🔒 <b>Вы в чёрном списке.</b>")
+        return
+
+    await save_or_update_username(tg_id, tg_username)
+
+    hp = await has_profile(tg_id)
+
+    if hp:
+        await message.answer("🙂 <b>Привет! Это бот знакомств.</b>")
+        await show_main_menu(message)
+    else:
+        text = (
+            "🙂 <b>Привет! Это бот знакомств.</b>\n\n"
+            "У тебя ещё нет анкеты. Давай заполним!\n\n"
+        )
+        text += main_menu_text(False)
+        await send_with_custom_kb(message.chat.id, text, main_menu_kb(False))
+
+
+# ===================== /activate /deactivate =====================
+
+
+@router.message(Command("activate"))
+async def cmd_activate(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    tg_id = message.from_user.id
+    if not await has_profile(tg_id):
+        await message.answer("❌ У тебя нет анкеты. Сначала заполни!")
+        return
+
+    await set_user_active(tg_id, 1)
+
+    # Сбрасываем очередь
+    db_id = await get_user_db_id(tg_id)
+    if db_id:
+        user_queues.pop(db_id, None)
+
+    hp = await has_profile(tg_id)
+    await send_with_custom_kb(
+        message.chat.id,
+        "✅ <b>Ваша анкета включена!</b>",
+        main_menu_kb(hp),
+    )
+    await show_main_menu(message)
+
+
+@router.message(Command("deactivate"))
+async def cmd_deactivate(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    tg_id = message.from_user.id
+    if not await has_profile(tg_id):
+        await message.answer("❌ У тебя нет анкеты. Сначала заполни!")
+        return
+
+    await set_user_active(tg_id, 0)
+
+    # Сбрасываем очередь
+    db_id = await get_user_db_id(tg_id)
+    if db_id:
+        user_queues.pop(db_id, None)
+
+    hp = await has_profile(tg_id)
+    await send_with_custom_kb(
+        message.chat.id,
+        "❌ <b>Ваша анкета выключена!</b>",
+        main_menu_kb(hp),
+    )
+    await show_main_menu(message)
+
+
+# ===================== /admin =====================
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    await send_with_custom_kb(
+        message.chat.id,
+        "⚙️ <b>Админ-панель</b>",
+        admin_menu_kb(),
+    )
+
+
+# ===================== КНОПКА 1 — ЗАПОЛНИТЬ АНКЕТУ =====================
+
+
+@router.message(F.text == "1")
+async def start_fill_profile(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+    await state.set_state(ProfileForm.photo)
+    await message.answer(
+        "🖼 <b>Отправь своё фото</b> (одну фотографию).",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(ProfileForm.photo, F.content_type == ContentType.PHOTO)
+async def process_photo(message: Message, state: FSMContext):
+    photo_file_id = message.photo[-1].file_id
+    await state.update_data(photo_file_id=photo_file_id)
+    await state.set_state(ProfileForm.name)
+    await message.answer("🖋 Как тебя зовут? (имя или ник)")
+
+
+@router.message(ProfileForm.photo)
+async def process_photo_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Пришли своё <b>фото</b>, пожалуйста.")
+
+
+@router.message(ProfileForm.name, F.text)
+async def process_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name or len(name) > 50:
+        await message.answer("❌ Имя не может быть пустым или длиннее 50 символов.")
+        return
+    await state.update_data(username=name)
+    await state.set_state(ProfileForm.age)
+    await message.answer("🖋 Сколько тебе лет?")
+
+
+@router.message(ProfileForm.name)
+async def process_name_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>текст</b> — своё имя.")
+
+
+@router.message(ProfileForm.age, F.text)
+async def process_age(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("❌ Напиши возраст <b>цифрами</b>.")
+        return
+    age = int(text)
+    if age < 17 or age > 100:
+        await message.answer("❌ Возраст должен быть от <b>17</b> до <b>100</b>.")
+        return
+    await state.update_data(age=age)
+    await state.set_state(ProfileForm.faculty)
+    await message.answer(
+        "🖋 Напиши свой факультет/направление.\n"
+        "Если не хочешь указывать — отправь <b>-</b>"
+    )
+
+
+@router.message(ProfileForm.age)
+async def process_age_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>число</b> — свой возраст.")
+
+
+@router.message(ProfileForm.faculty, F.text)
+async def process_faculty(message: Message, state: FSMContext):
+    faculty = message.text.strip()
+    if faculty == "-":
+        faculty = None
+    await state.update_data(faculty=faculty)
+    await state.set_state(ProfileForm.about)
+    await message.answer("🖋 Напиши краткое описание о себе.")
+
+
+@router.message(ProfileForm.faculty)
+async def process_faculty_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>текст</b>.")
+
+
+@router.message(ProfileForm.about, F.text)
+async def process_about(message: Message, state: FSMContext):
+    about = message.text.strip()
+    if not about:
+        await message.answer("❌ Описание не может быть пустым.")
+        return
+    await state.update_data(about=about)
+    await state.set_state(ProfileForm.gender)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        "👤 <b>Я:</b>",
+        gender_kb(),
+    )
+
+
+@router.message(ProfileForm.about)
+async def process_about_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>текст</b> — описание о себе.")
+
+
+@router.message(ProfileForm.gender, F.text.in_({"Парень", "Девушка"}))
+async def process_gender(message: Message, state: FSMContext):
+    gender = "m" if message.text == "Парень" else "f"
+    await state.update_data(gender=gender)
+    await state.set_state(ProfileForm.looking_for)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        "👥 <b>Кого ищу:</b>",
+        looking_for_kb(),
+    )
+
+
+@router.message(ProfileForm.gender)
+async def process_gender_invalid(message: Message, state: FSMContext):
+    await send_with_custom_kb(
+        message.chat.id,
+        "❌ Выбери <b>Парень</b> или <b>Девушка</b>.",
+        gender_kb(),
+    )
+
+
+@router.message(ProfileForm.looking_for, F.text.in_({"Парня", "Девушку", "Всех"}))
+async def process_looking_for(message: Message, state: FSMContext):
+    mapping = {"Парня": "m", "Девушку": "f", "Всех": "all"}
+    looking_for = mapping[message.text]
+    await state.update_data(looking_for=looking_for)
+
+    # Сохраняем анкету сразу, по умолчанию активна
+    data = await state.get_data()
+    await state.clear()
+
+    tg_id = message.from_user.id
+    tg_username = message.from_user.username
+
+    await upsert_profile(
+        tg_id=tg_id,
+        username=data["username"],
+        tg_username=tg_username,
+        photo_file_id=data["photo_file_id"],
+        gender=data["gender"],
+        age=data["age"],
+        faculty=data.get("faculty"),
+        about=data["about"],
+        is_active=1,
+        looking_for=looking_for,
+    )
+
+    # Сбрасываем очередь
+    db_id = await get_user_db_id(tg_id)
+    if db_id:
+        user_queues.pop(db_id, None)
+
+    user = await get_user_by_tg_id(tg_id)
+
+    await message.answer("✅ <b>Вот твоя анкета:</b>")
+    await send_profile_card(message.chat.id, user, main_menu_kb(True), show_status=True)
+    await show_main_menu(message)
+
+
+@router.message(ProfileForm.looking_for)
+async def process_looking_for_invalid(message: Message, state: FSMContext):
+    await send_with_custom_kb(
+        message.chat.id,
+        "❌ Выбери: <b>Парня</b>, <b>Девушку</b> или <b>Всех</b>.",
+        looking_for_kb(),
+    )
+
+
+# ===================== КНОПКА 3 — МОЯ АНКЕТА =====================
+
+
+@router.message(F.text == "3")
+async def my_profile(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+
+    user = await get_user_by_tg_id(message.from_user.id)
+    if not user or not user.get("username"):
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ У тебя нет анкеты. Нажми <b>1</b> чтобы заполнить.",
+            main_menu_kb(False),
+        )
+        return
+
+    await send_profile_card(message.chat.id, user, my_profile_menu_kb(), show_status=True)
+
+
+# ===================== ПОДМЕНЮ "МОЯ АНКЕТА" =====================
+
+
+@router.message(F.text == "📋 Смотреть анкеты")
+async def my_profile_browse(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+
+    if not await has_profile(message.from_user.id):
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ Сначала заполни анкету! Нажми <b>1</b>.",
+            main_menu_kb(False),
+        )
+        return
+
+    # Проверяем входящие лайки
+    incoming_count = await get_incoming_likes_count(message.from_user.id)
+    if incoming_count > 0:
+        word = "человеку" if incoming_count == 1 else "людям"
+        await send_with_custom_kb(
+            message.chat.id,
+            f"❤️ Ты понравился <b>{incoming_count}</b> {word}!",
+            view_likes_kb(),
+        )
+        return
+
+    await show_random_profile(message)
+
+
+@router.message(F.text == "🔄 Заполнить заново")
+async def my_profile_refill(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+    await state.set_state(ProfileForm.photo)
+    await message.answer(
+        "🖼 <b>Отправь своё фото</b> (одну фотографию).",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(F.text == "🖼 Изменить фото")
+async def my_profile_change_photo(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    if not await has_profile(message.from_user.id):
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ У тебя нет анкеты. Нажми <b>1</b> чтобы заполнить.",
+            main_menu_kb(False),
+        )
+        return
+
+    await state.clear()
+    await state.set_state(EditPhotoForm.waiting_photo)
+    await message.answer(
+        "🖼 <b>Отправь новое фото</b> для анкеты.\n\nДля отмены отправь /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), EditPhotoForm.waiting_photo)
+async def cancel_edit_photo(message: Message, state: FSMContext):
+    await state.clear()
+    user = await get_user_by_tg_id(message.from_user.id)
+    if user and user.get("username"):
+        await send_profile_card(message.chat.id, user, my_profile_menu_kb(), show_status=True)
+    else:
+        await show_main_menu(message)
+
+
+@router.message(EditPhotoForm.waiting_photo, F.content_type == ContentType.PHOTO)
+async def process_edit_photo(message: Message, state: FSMContext):
+    photo_file_id = message.photo[-1].file_id
+    await update_user_photo(message.from_user.id, photo_file_id)
+    await state.clear()
+
+    user = await get_user_by_tg_id(message.from_user.id)
+    await message.answer("✅ <b>Фото обновлено!</b>")
+    await send_profile_card(message.chat.id, user, my_profile_menu_kb(), show_status=True)
+
+
+@router.message(EditPhotoForm.waiting_photo)
+async def process_edit_photo_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Пришли <b>фото</b>, пожалуйста. Для отмены: /cancel")
+
+
+@router.message(F.text == "✏️ Изменить текст")
+async def my_profile_change_text(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    if not await has_profile(message.from_user.id):
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ У тебя нет анкеты. Нажми <b>1</b> чтобы заполнить.",
+            main_menu_kb(False),
+        )
+        return
+
+    await state.clear()
+    await state.set_state(EditTextForm.waiting_text)
+    await message.answer(
+        "✏️ <b>Отправь новый текст описания</b> для анкеты.\n\nДля отмены отправь /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), EditTextForm.waiting_text)
+async def cancel_edit_text(message: Message, state: FSMContext):
+    await state.clear()
+    user = await get_user_by_tg_id(message.from_user.id)
+    if user and user.get("username"):
+        await send_profile_card(message.chat.id, user, my_profile_menu_kb(), show_status=True)
+    else:
+        await show_main_menu(message)
+
+
+@router.message(EditTextForm.waiting_text, F.text)
+async def process_edit_text(message: Message, state: FSMContext):
+    new_text = message.text.strip()
+    if not new_text:
+        await message.answer("❌ Текст не может быть пустым.")
+        return
+
+    await update_user_about(message.from_user.id, new_text)
+    await state.clear()
+
+    user = await get_user_by_tg_id(message.from_user.id)
+    await message.answer("✅ <b>Текст анкеты обновлён!</b>")
+    await send_profile_card(message.chat.id, user, my_profile_menu_kb(), show_status=True)
+
+
+@router.message(EditTextForm.waiting_text)
+async def process_edit_text_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Отправь <b>текст</b>. Для отмены: /cancel")
+
+
+@router.message(F.text == "🔙 Главное меню")
+async def back_to_main_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await show_main_menu(message)
+
+
+# ===================== КНОПКА 4 — ПОДДЕРЖКА =====================
+
+
+@router.message(F.text == "4")
+async def support(message: Message, state: FSMContext):
+    await state.clear()
+    hp = await has_profile(message.from_user.id)
+    await send_with_custom_kb(
+        message.chat.id,
+        f"ℹ️ <b>Поддержка</b>\n\n"
+        f"По вопросам бота пиши: {SUPPORT_USERNAME}",
+        main_menu_kb(hp),
+    )
+    await show_main_menu(message)
+
+
+# ===================== КНОПКА 2 — СМОТРЕТЬ АНКЕТЫ =====================
+
+
+@router.message(F.text == "2")
+async def browse_profiles(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+
+    if not await has_profile(message.from_user.id):
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ Сначала заполни анкету! Нажми <b>1</b>.",
+            main_menu_kb(False),
+        )
+        return
+
+    # Проверяем входящие лайки
+    incoming_count = await get_incoming_likes_count(message.from_user.id)
+    if incoming_count > 0:
+        word = "человеку" if incoming_count == 1 else "людям"
+        await send_with_custom_kb(
+            message.chat.id,
+            f"❤️ Ты понравился <b>{incoming_count}</b> {word}!",
+            view_likes_kb(),
+        )
+        return
+
+    await show_random_profile(message)
+
+
+async def show_random_profile(message: Message):
+    profile = await get_next_profile_for_view(message.from_user.id)
+    if not profile:
+        hp = await has_profile(message.from_user.id)
+        await send_with_custom_kb(
+            message.chat.id,
+            "❌ Пока нет подходящих анкет. Попробуй позже!",
+            main_menu_kb(hp),
+        )
+        current_targets.pop(message.from_user.id, None)
+        return
+
+    current_targets[message.from_user.id] = profile["tg_id"]
+    await send_profile_card(message.chat.id, profile, browse_kb())
+
+
+async def show_incoming_like_profile(message: Message):
+    profile = await get_one_incoming_like_profile(message.from_user.id)
+    if profile:
+        current_targets[message.from_user.id] = profile["tg_id"]
+
+        remaining = await get_incoming_likes_count(message.from_user.id)
+
+        await send_profile_card(message.chat.id, profile, incoming_like_kb())
+
+        if remaining > 0:
+            word = "анкета" if remaining == 1 else "анкет"
+            await send_with_custom_kb(
+                message.chat.id,
+                f"🔔 Ещё <b>{remaining}</b> {word}",
+                incoming_like_kb(),
+            )
+    else:
+        await show_random_profile(message)
+
+
+# ===================== ПОСМОТРЕТЬ (входящие лайки) =====================
+
+
+@router.message(F.text == "Посмотреть")
+async def view_incoming_likes(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+    await state.clear()
+    await show_incoming_like_profile(message)
+
+
+# ===================== ❤️ ЛАЙК =====================
+
+
+@router.message(F.text == "❤️")
+async def handle_like(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    user_tg_id = message.from_user.id
+    target_tg_id = current_targets.get(user_tg_id)
+
+    if target_tg_id is None:
+        await message.answer(
+            "❌ Не могу понять, кого лайкать. Нажми <b>2</b> чтобы смотреть анкеты."
+        )
+        return
+
+    mutual = await add_like(user_tg_id, target_tg_id)
+
+    if mutual:
+        user_a = await get_user_by_tg_id(user_tg_id)
+        user_b = await get_user_by_tg_id(target_tg_id)
+
+        link_a = get_clickable_username(user_a) if user_a else "?"
+        link_b = get_clickable_username(user_b) if user_b else "?"
+
+        try:
+            await bot.send_message(
+                user_tg_id,
+                f"🎉 <b>У вас взаимная симпатия!</b>\n"
+                f"Напиши: {link_b}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        try:
+            await bot.send_message(
+                target_tg_id,
+                f"🎉 <b>У вас взаимная симпатия!</b>\n"
+                f"Напиши: {link_a}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    else:
+        # Уведомляем target только если лайк новый (не повторный)
+        # add_like уже проверяет existing, так что уведомляем
+        target_db_id = await get_user_db_id(target_tg_id)
+        if target_db_id:
+            db = await get_db()
+            rows = await db.execute_fetchall(
+                "SELECT COUNT(*) FROM swipes WHERE target_id=? AND is_like=1 AND viewed_in_incoming=0",
+                (target_db_id,),
+            )
+            await db.close()
+            count = rows[0][0] if rows else 0
+
+            if count > 0:
+                word = "человеку" if count == 1 else "людям"
+                try:
+                    await send_with_custom_kb(
+                        target_tg_id,
+                        f"❤️ Ты понравился <b>{count}</b> {word}!",
+                        view_likes_kb(),
+                    )
+                except Exception:
+                    pass
+
+    incoming = await get_incoming_likes_count(user_tg_id)
+    if incoming > 0:
+        await show_incoming_like_profile(message)
+    else:
+        await show_random_profile(message)
+
+
+# ===================== 👎 ДИЗЛАЙК =====================
+
+
+@router.message(F.text == "👎")
+async def handle_dislike(message: Message, state: FSMContext):
+    if await check_blacklist(message):
+        return
+
+    user_tg_id = message.from_user.id
+    target_tg_id = current_targets.get(user_tg_id)
+
+    if target_tg_id:
+        await add_dislike(user_tg_id, target_tg_id)
+
+    incoming = await get_incoming_likes_count(user_tg_id)
+    if incoming > 0:
+        await show_incoming_like_profile(message)
+    else:
+        await show_random_profile(message)
+
+
+# ===================== 💤 МЕНЮ (из просмотра) =====================
+
+
+@router.message(F.text == "💤")
+async def handle_sleep(message: Message, state: FSMContext):
+    await state.clear()
+    current_targets.pop(message.from_user.id, None)
+    await show_main_menu(message)
+
+
+# ===================== АДМИН: ТОП-10 =====================
+
+
+@router.message(F.text == "Топ-10 анкет")
+async def admin_top(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    top = await get_top_profiles(10)
+    if not top:
+        await send_with_custom_kb(
+            message.chat.id,
+            "📊 Пока нет статистики.",
+            admin_menu_kb(),
+        )
+        return
+
+    lines = []
+    for i, p in enumerate(top, 1):
+        name = p.get("username", "?")
+        age = p.get("age", "?")
+        likes = p.get("likes_count", 0)
+        lines.append(f"{i}. <b>{html_module.escape(str(name))}</b> ({age}) — {likes} ❤️")
+
+    await send_with_custom_kb(
+        message.chat.id,
+        "📊 <b>Топ-10 анкет по лайкам:</b>\n\n" + "\n".join(lines),
+        admin_menu_kb(),
+    )
+
+
+# ===================== АДМИН: ЧЁРНЫЙ СПИСОК =====================
+
+
+@router.message(F.text == "Чёрный список")
+async def admin_blacklist(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    await send_with_custom_kb(
+        message.chat.id,
+        "🔒 <b>Чёрный список</b>\n\nВыбери действие:",
+        blacklist_menu_kb(),
+    )
+
+
+@router.message(F.text == "Добавить в ЧС")
+async def admin_bl_add(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(BlacklistForm.waiting_id)
+    await state.update_data(bl_action="add")
+    await message.answer(
+        "🖋 Отправь <b>tg_id</b> пользователя для добавления в ЧС.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(F.text == "Убрать из ЧС")
+async def admin_bl_remove(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(BlacklistForm.waiting_id)
+    await state.update_data(bl_action="remove")
+    await message.answer(
+        "🖋 Отправь <b>tg_id</b> пользователя для удаления из ЧС.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(BlacklistForm.waiting_id, F.text)
+async def admin_bl_process(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("❌ Отправь <b>числовой</b> tg_id.")
+        return
+
+    tg_id = int(text)
+    data = await state.get_data()
+    action = data.get("bl_action")
+    await state.clear()
+
+    if action == "add":
+        await add_to_blacklist(tg_id)
+        await send_with_custom_kb(
+            message.chat.id,
+            f"✅ Пользователь <b>{tg_id}</b> добавлен в ЧС.",
+            admin_menu_kb(),
+        )
+    else:
+        await remove_from_blacklist(tg_id)
+        await send_with_custom_kb(
+            message.chat.id,
+            f"✅ Пользователь <b>{tg_id}</b> удалён из ЧС.",
+            admin_menu_kb(),
+        )
+
+
+@router.message(F.text == "Назад в админку")
+async def admin_back(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    await send_with_custom_kb(
+        message.chat.id,
+        "⚙️ <b>Админ-панель</b>",
+        admin_menu_kb(),
+    )
+
+
+# ===================== АДМИН: ТУМБЛЕР МЭТЧА =====================
+
+
+@router.message(F.text == "Тумблер мэтча")
+async def admin_match_toggle(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    current = await get_setting("hide_matched")
+    if current == "1":
+        await set_setting("hide_matched", "0")
+        await send_with_custom_kb(
+            message.chat.id,
+            "🔓 Фильтр мэтчей <b>ВЫКЛЮЧЕН</b>.\n"
+            "Анкеты с мэтчем будут показываться снова.",
+            admin_menu_kb(),
+        )
+    else:
+        await set_setting("hide_matched", "1")
+        await send_with_custom_kb(
+            message.chat.id,
+            "🔒 Фильтр мэтчей <b>ВКЛЮЧЁН</b>.\n"
+            "Анкеты с мэтчем больше не показываются.",
+            admin_menu_kb(),
+        )
+
+
+# ===================== АДМИН: РАССЫЛКА =====================
+
+
+@router.message(F.text == "Рассылка")
+async def admin_broadcast_start(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(BroadcastForm.waiting_message)
+    await message.answer(
+        "📣 <b>Отправь сообщение для рассылки.</b>\n\n"
+        "Можно отправить текст, фото с подписью или GIF с подписью.\n"
+        "Для отмены отправь /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), BroadcastForm.waiting_message)
+async def admin_broadcast_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await send_with_custom_kb(
+        message.chat.id,
+        "❌ Рассылка отменена.",
+        admin_menu_kb(),
+    )
+
+
+@router.message(BroadcastForm.waiting_message, F.content_type.in_({ContentType.TEXT, ContentType.PHOTO, ContentType.ANIMATION}))
+async def admin_broadcast_send(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+
+    sender_tg_id = message.from_user.id
+    all_ids = await get_all_user_tg_ids()
+    success = 0
+    fail = 0
+
+    for tg_id in all_ids:
+        # Не отправляем рассылку самому админу, который её делает
+        if tg_id == sender_tg_id:
+            continue
+        try:
+            if message.content_type == ContentType.PHOTO:
+                await bot.send_photo(
+                    tg_id,
+                    message.photo[-1].file_id,
+                    caption=message.caption or "",
+                    parse_mode=ParseMode.HTML,
+                )
+            elif message.content_type == ContentType.ANIMATION:
+                await bot.send_animation(
+                    tg_id,
+                    message.animation.file_id,
+                    caption=message.caption or "",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await bot.send_message(
+                    tg_id,
+                    message.text,
+                    parse_mode=ParseMode.HTML,
+                )
+            success += 1
+        except Exception:
+            fail += 1
+
+        await asyncio.sleep(0.05)
+
+    await send_with_custom_kb(
+        message.chat.id,
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"Успешно: {success}\n"
+        f"Ошибок: {fail}",
+        admin_menu_kb(),
+    )
+
+
+@router.message(BroadcastForm.waiting_message)
+async def admin_broadcast_invalid(message: Message, state: FSMContext):
+    await message.answer(
+        "❌ Отправь <b>текст</b>, <b>фото</b> или <b>GIF</b>.\n"
+        "Для отмены: /cancel"
+    )
+
+
+# ===================== ВЫЙТИ ИЗ АДМИНКИ =====================
+
+
+@router.message(F.text == "Выйти из админки")
+async def admin_exit(message: Message, state: FSMContext):
+    await state.clear()
+    await show_main_menu(message)
+
+
+# ===================== FALLBACK =====================
+
+
+@router.message()
+async def fallback(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
+        return
+
+    hp = await has_profile(message.from_user.id)
+    await send_with_custom_kb(
+        message.chat.id,
+        "ℹ️ Не понимаю. Используй кнопки меню или нажми /start",
+        main_menu_kb(hp),
+    )
+
+
+# ===================== MAIN =====================
+
+
+async def main():
+    await init_db()
+    logger.info("Bot started")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
