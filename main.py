@@ -40,7 +40,11 @@ COMPLAINT_BOT_TOKEN = os.getenv("HELPER_BOT_TOKEN")
 
 ADMIN_IDS = {1056843400, 5002429263}
 SUPPORT_USERNAME = "@hekomar"
-DB_PATH = "dating_bot.db"
+if os.path.exists("/app/data"):
+    DB_PATH = "/app/data/dating_bot.db"
+else:
+    DB_PATH = "dating_bot.db"
+
 HIDE_MATCHED_PROFILES = True
 
 # ===================== БОТ ДЛЯ ЖАЛОБ =====================
