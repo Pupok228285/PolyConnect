@@ -1343,7 +1343,8 @@ async def donate_author(message: Message, state: FSMContext):
 
     donate_text = (
         "💝 <b>Поддержите донатом))</b>\n\n"
-        "<blockquote>Реквизиты(Юmoney): 5599002134180282</blockquote>"
+        "<blockquote>Реквизиты(Юmoney):\n\n"
+        " 5599002134180282</blockquote>"
     )
     await send_with_custom_kb(
         message.chat.id,
