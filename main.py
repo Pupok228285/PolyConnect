@@ -1342,10 +1342,8 @@ async def donate_author(message: Message, state: FSMContext):
     hp = await has_profile(message.from_user.id)
 
     donate_text = (
-        "💝 <b>Поддержите автора любой суммой</b>\n\n"
-        "<blockquote>Реквизиты: 32534754634634\n"
-        "Получатель: Писькин\n"
-        "банк озов</blockquote>"
+        "💝 <b>Поддержите донатом))</b>\n\n"
+        "<blockquote>Реквизиты(Юmoney): 5599002134180282"
     )
     await send_with_custom_kb(
         message.chat.id,
