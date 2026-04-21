@@ -11,6 +11,7 @@ import telebot
 from dotenv import load_dotenv
 
 import asyncpg
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, StateFilter
@@ -60,6 +61,9 @@ main_bot = telebot.TeleBot(API_TOKEN)
 helper_bot = telebot.TeleBot(COMPLAINT_BOT_TOKEN)
 
 # ===================== PREMIUM EMOJI IDS =====================
+sw_created = r.get("created_at")
+if isinstance(sw_created, str):
+    sw_created = datetime.fromisoformat(sw_created)
 
 EMOJI_SETTINGS = "5870982283724328568"
 EMOJI_PROFILE = "5870994129244131212"
@@ -248,15 +252,16 @@ async def migrate_from_sqlite():
                 INSERT INTO users (tg_id, tg_username, username, photo_file_id,
                                    gender, age, faculty, about, is_active,
                                    looking_for, created_at, updated_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
                 ON CONFLICT (tg_id) DO NOTHING
                 """,
                 r.get("tg_id"), r.get("tg_username"), r.get("username"),
                 r.get("photo_file_id"), r.get("gender"), r.get("age"),
                 r.get("faculty"), r.get("about"), r.get("is_active"),
-                r.get("looking_for"), r.get("created_at"), r.get("updated_at"),
+                r.get("looking_for")
+                # Заметь: r.get("created_at") и r.get("updated_at") здесь больше НЕ НУЖНЫ
             )
-        logger.info(f"Migrated {len(rows)} users")
+    logger.info(f"Migrated {len(rows)} users with current timestamp")
 
     # Маппинг старых SQLite id -> новые PG id
     id_map: dict[int, int] = {}
