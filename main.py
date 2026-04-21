@@ -10,7 +10,7 @@ import os
 import telebot
 from dotenv import load_dotenv
 
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, StateFilter
@@ -31,27 +31,31 @@ from aiogram.types import (
 
 # ===================== НАСТРОЙКИ =====================
 
-# Загружаем переменные из скрытого файла .env (нужно для работы на твоем ПК)
 load_dotenv()
 
-# Берем токены из окружения
 API_TOKEN = os.getenv("MAIN_BOT_TOKEN")
 COMPLAINT_BOT_TOKEN = os.getenv("HELPER_BOT_TOKEN")
 
+# PostgreSQL
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "postgres")
+DB_NAME = os.getenv("DB_NAME", "dating_bot")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+
+# Путь к старой SQLite-базе (для миграции)
+if os.path.exists("/app/data"):
+    SQLITE_DB_PATH = "/app/data/dating_bot.db"
+else:
+    SQLITE_DB_PATH = "dating_bot.db"
+
 ADMIN_IDS = {1056843400, 5002429263}
 SUPPORT_USERNAME = "@hekomar"
-if os.path.exists("/app/data"):
-    DB_PATH = "/app/data/dating_bot.db"
-else:
-    DB_PATH = "dating_bot.db"
-
 HIDE_MATCHED_PROFILES = True
 
 # ===================== БОТ ДЛЯ ЖАЛОБ =====================
-# Твой chat_id (куда бот будет слать жалобы)
 COMPLAINT_CHAT_ID = 1056843400
 
-# Запускаем ботов
 main_bot = telebot.TeleBot(API_TOKEN)
 helper_bot = telebot.TeleBot(COMPLAINT_BOT_TOKEN)
 
@@ -133,108 +137,259 @@ class ComplaintForm(StatesGroup):
 current_targets: dict[int, int] = {}
 user_queues: dict[int, list[int]] = {}
 
-# ===================== DATABASE =====================
+# ===================== ГЛОБАЛЬНЫЙ ПУЛ ASYNCPG =====================
+
+pool: Optional[asyncpg.Pool] = None
 
 
-async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(DB_PATH, timeout=10.0)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    return db
+async def create_pool():
+    global pool
+    pool = await asyncpg.create_pool(
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        min_size=2,
+        max_size=10,
+    )
+    logger.info("PostgreSQL connection pool created")
+
+
+# ===================== DATABASE — INIT =====================
 
 
 async def init_db():
-    db = await get_db()
-    await db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            tg_username TEXT,
-            username TEXT,
-            photo_file_id TEXT,
-            gender TEXT,
-            age INTEGER,
-            faculty TEXT,
-            about TEXT,
-            is_active INTEGER DEFAULT 1,
-            looking_for TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                tg_id BIGINT UNIQUE,
+                tg_username TEXT,
+                username TEXT,
+                photo_file_id TEXT,
+                gender TEXT,
+                age INTEGER,
+                faculty TEXT,
+                about TEXT,
+                is_active INTEGER DEFAULT 1,
+                looking_for TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS swipes (
+                id SERIAL PRIMARY KEY,
+                viewer_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                is_like INTEGER NOT NULL DEFAULT 0,
+                viewed_in_incoming INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                id SERIAL PRIMARY KEY,
+                user_a_id INTEGER NOT NULL,
+                user_b_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_a_id, user_b_id)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id SERIAL PRIMARY KEY,
+                tg_id BIGINT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", "hide_matched")
+        if row is None:
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES ($1, $2)",
+                "hide_matched", "1",
+            )
+    logger.info("Database tables initialized")
 
-        CREATE TABLE IF NOT EXISTS swipes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            viewer_id INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            is_like INTEGER NOT NULL DEFAULT 0,
-            viewed_in_incoming INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
 
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_a_id INTEGER NOT NULL,
-            user_b_id INTEGER NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_a_id, user_b_id)
-        );
+# ===================== МИГРАЦИЯ ИЗ SQLITE =====================
 
-        CREATE TABLE IF NOT EXISTS blacklist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
 
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        """
-    )
-    row = await db.execute_fetchall("SELECT value FROM settings WHERE key='hide_matched'")
-    if not row:
-        await db.execute("INSERT INTO settings (key, value) VALUES ('hide_matched', '1')")
-    await db.commit()
-    await db.close()
+async def migrate_from_sqlite():
+    marker = SQLITE_DB_PATH + ".migrated"
+    if not os.path.exists(SQLITE_DB_PATH):
+        logger.info("SQLite file not found — skipping migration")
+        return
+    if os.path.exists(marker):
+        logger.info("Migration marker found — skipping migration")
+        return
+
+    logger.info("Starting migration from SQLite -> PostgreSQL ...")
+
+    import aiosqlite
+
+    sqlite_db = await aiosqlite.connect(SQLITE_DB_PATH)
+    sqlite_db.row_factory = aiosqlite.Row
+
+    # --- users ---
+    rows = await sqlite_db.execute_fetchall("SELECT * FROM users")
+    async with pool.acquire() as conn:
+        for r in rows:
+            r = dict(r)
+            await conn.execute(
+                """
+                INSERT INTO users (tg_id, tg_username, username, photo_file_id,
+                                   gender, age, faculty, about, is_active,
+                                   looking_for, created_at, updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (tg_id) DO NOTHING
+                """,
+                r.get("tg_id"), r.get("tg_username"), r.get("username"),
+                r.get("photo_file_id"), r.get("gender"), r.get("age"),
+                r.get("faculty"), r.get("about"), r.get("is_active"),
+                r.get("looking_for"), r.get("created_at"), r.get("updated_at"),
+            )
+        logger.info(f"Migrated {len(rows)} users")
+
+    # Маппинг старых SQLite id -> новые PG id
+    id_map: dict[int, int] = {}
+    async with pool.acquire() as conn:
+        pg_users = await conn.fetch("SELECT id, tg_id FROM users")
+    tg_to_pg = {row["tg_id"]: row["id"] for row in pg_users}
+
+    sqlite_users = await sqlite_db.execute_fetchall("SELECT id, tg_id FROM users")
+    for su in sqlite_users:
+        su = dict(su)
+        old_id = su["id"]
+        tg_id = su["tg_id"]
+        if tg_id in tg_to_pg:
+            id_map[old_id] = tg_to_pg[tg_id]
+
+    # --- swipes ---
+    rows = await sqlite_db.execute_fetchall("SELECT * FROM swipes")
+    async with pool.acquire() as conn:
+        migrated_swipes = 0
+        for r in rows:
+            r = dict(r)
+            new_viewer = id_map.get(r.get("viewer_id"))
+            new_target = id_map.get(r.get("target_id"))
+            if new_viewer is None or new_target is None:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO swipes (viewer_id, target_id, is_like,
+                                    viewed_in_incoming, created_at)
+                VALUES ($1,$2,$3,$4,$5)
+                """,
+                new_viewer, new_target, r.get("is_like", 0),
+                r.get("viewed_in_incoming", 0), r.get("created_at"),
+            )
+            migrated_swipes += 1
+        logger.info(f"Migrated {migrated_swipes} swipes")
+
+    # --- matches ---
+    rows = await sqlite_db.execute_fetchall("SELECT * FROM matches")
+    async with pool.acquire() as conn:
+        migrated_matches = 0
+        for r in rows:
+            r = dict(r)
+            new_a = id_map.get(r.get("user_a_id"))
+            new_b = id_map.get(r.get("user_b_id"))
+            if new_a is None or new_b is None:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO matches (user_a_id, user_b_id, created_at)
+                VALUES ($1,$2,$3)
+                ON CONFLICT (user_a_id, user_b_id) DO NOTHING
+                """,
+                new_a, new_b, r.get("created_at"),
+            )
+            migrated_matches += 1
+        logger.info(f"Migrated {migrated_matches} matches")
+
+    # --- blacklist ---
+    rows = await sqlite_db.execute_fetchall("SELECT * FROM blacklist")
+    async with pool.acquire() as conn:
+        for r in rows:
+            r = dict(r)
+            await conn.execute(
+                """
+                INSERT INTO blacklist (tg_id, created_at)
+                VALUES ($1,$2)
+                ON CONFLICT (tg_id) DO NOTHING
+                """,
+                r.get("tg_id"), r.get("created_at"),
+            )
+        logger.info(f"Migrated {len(rows)} blacklist entries")
+
+    # --- settings ---
+    rows = await sqlite_db.execute_fetchall("SELECT * FROM settings")
+    async with pool.acquire() as conn:
+        for r in rows:
+            r = dict(r)
+            await conn.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ($1,$2)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                r.get("key"), r.get("value"),
+            )
+        logger.info(f"Migrated {len(rows)} settings")
+
+    await sqlite_db.close()
+
+    with open(marker, "w") as f:
+        f.write("done")
+
+    logger.info("Migration from SQLite -> PostgreSQL completed!")
+
+
+# ===================== DATABASE — ФУНКЦИИ =====================
 
 
 async def is_blacklisted(tg_id: int) -> bool:
-    db = await get_db()
-    row = await db.execute_fetchall("SELECT 1 FROM blacklist WHERE tg_id=?", (tg_id,))
-    await db.close()
-    return len(row) > 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT 1 FROM blacklist WHERE tg_id=$1", tg_id)
+    return row is not None
 
 
 async def add_to_blacklist(tg_id: int):
-    db = await get_db()
-    await db.execute("INSERT OR IGNORE INTO blacklist (tg_id) VALUES (?)", (tg_id,))
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO blacklist (tg_id) VALUES ($1) ON CONFLICT (tg_id) DO NOTHING",
+            tg_id,
+        )
 
 
 async def remove_from_blacklist(tg_id: int):
-    db = await get_db()
-    await db.execute("DELETE FROM blacklist WHERE tg_id=?", (tg_id,))
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM blacklist WHERE tg_id=$1", tg_id)
 
 
 async def get_setting(key: str) -> Optional[str]:
-    db = await get_db()
-    rows = await db.execute_fetchall("SELECT value FROM settings WHERE key=?", (key,))
-    await db.close()
-    return rows[0][0] if rows else None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
+    return row["value"] if row else None
 
 
 async def set_setting(key: str, value: str):
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """,
+            key, value,
+        )
 
 
 async def get_hide_matched() -> bool:
@@ -243,17 +398,15 @@ async def get_hide_matched() -> bool:
 
 
 async def save_or_update_username(tg_id: int, tg_username: Optional[str]):
-    db = await get_db()
-    await db.execute(
-        """
-        INSERT INTO users (tg_id, tg_username)
-        VALUES (?, ?)
-        ON CONFLICT(tg_id) DO UPDATE SET tg_username=excluded.tg_username
-        """,
-        (tg_id, tg_username),
-    )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (tg_id, tg_username)
+            VALUES ($1, $2)
+            ON CONFLICT (tg_id) DO UPDATE SET tg_username=EXCLUDED.tg_username
+            """,
+            tg_id, tg_username,
+        )
 
 
 async def upsert_profile(
@@ -268,72 +421,66 @@ async def upsert_profile(
     is_active: int,
     looking_for: str,
 ):
-    db = await get_db()
-    row = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (tg_id,))
-    if row:
-        await db.execute(
-            """
-            UPDATE users SET
-                username=?, tg_username=?, photo_file_id=?, gender=?,
-                age=?, faculty=?, about=?, is_active=?, looking_for=?,
-                updated_at=CURRENT_TIMESTAMP
-            WHERE tg_id=?
-            """,
-            (username, tg_username, photo_file_id, gender, age, faculty, about, is_active, looking_for, tg_id),
-        )
-    else:
-        await db.execute(
-            """
-            INSERT INTO users (tg_id, tg_username, username, photo_file_id, gender, age, faculty, about, is_active, looking_for)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (tg_id, tg_username, username, photo_file_id, gender, age, faculty, about, is_active, looking_for),
-        )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", tg_id)
+        if row:
+            await conn.execute(
+                """
+                UPDATE users SET
+                    username=$1, tg_username=$2, photo_file_id=$3, gender=$4,
+                    age=$5, faculty=$6, about=$7, is_active=$8, looking_for=$9,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE tg_id=$10
+                """,
+                username, tg_username, photo_file_id, gender,
+                age, faculty, about, is_active, looking_for, tg_id,
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO users (tg_id, tg_username, username, photo_file_id,
+                                   gender, age, faculty, about, is_active, looking_for)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                """,
+                tg_id, tg_username, username, photo_file_id,
+                gender, age, faculty, about, is_active, looking_for,
+            )
 
 
 async def get_user_by_tg_id(tg_id: int) -> Optional[dict]:
-    db = await get_db()
-    rows = await db.execute_fetchall("SELECT * FROM users WHERE tg_id=?", (tg_id,))
-    await db.close()
-    if rows:
-        return dict(rows[0])
-    return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
+    return dict(row) if row else None
 
 
 async def get_user_db_id(tg_id: int) -> Optional[int]:
-    db = await get_db()
-    rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (tg_id,))
-    await db.close()
-    return rows[0][0] if rows else None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", tg_id)
+    return row["id"] if row else None
 
 
 async def set_user_active(tg_id: int, is_active: int):
-    db = await get_db()
-    await db.execute("UPDATE users SET is_active=? WHERE tg_id=?", (is_active, tg_id))
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET is_active=$1 WHERE tg_id=$2",
+            is_active, tg_id,
+        )
 
 
 async def update_user_photo(tg_id: int, photo_file_id: str):
-    db = await get_db()
-    await db.execute(
-        "UPDATE users SET photo_file_id=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?",
-        (photo_file_id, tg_id),
-    )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET photo_file_id=$1, updated_at=CURRENT_TIMESTAMP WHERE tg_id=$2",
+            photo_file_id, tg_id,
+        )
 
 
 async def update_user_about(tg_id: int, about: str):
-    db = await get_db()
-    await db.execute(
-        "UPDATE users SET about=?, updated_at=CURRENT_TIMESTAMP WHERE tg_id=?",
-        (about, tg_id),
-    )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET about=$1, updated_at=CURRENT_TIMESTAMP WHERE tg_id=$2",
+            about, tg_id,
+        )
 
 
 async def has_profile(tg_id: int) -> bool:
@@ -344,45 +491,44 @@ async def has_profile(tg_id: int) -> bool:
 
 
 async def get_candidate_ids(viewer_db_id: int) -> list[int]:
-    db = await get_db()
-    viewer_rows = await db.execute_fetchall("SELECT gender, looking_for FROM users WHERE id=?", (viewer_db_id,))
-    if not viewer_rows:
-        await db.close()
-        return []
+    async with pool.acquire() as conn:
+        viewer_row = await conn.fetchrow(
+            "SELECT gender, looking_for FROM users WHERE id=$1", viewer_db_id
+        )
+        if not viewer_row:
+            return []
 
-    viewer = dict(viewer_rows[0])
-    looking_for = viewer.get("looking_for") or "all"
+        looking_for = viewer_row["looking_for"] or "all"
 
-    gender_clause = ""
-    if looking_for == "m":
-        gender_clause = "AND u.gender='m'"
-    elif looking_for == "f":
-        gender_clause = "AND u.gender='f'"
+        gender_clause = ""
+        if looking_for == "m":
+            gender_clause = "AND u.gender='m'"
+        elif looking_for == "f":
+            gender_clause = "AND u.gender='f'"
 
-    hide_matched = await get_hide_matched()
-    match_clause = ""
-    if hide_matched:
-        match_clause = f"""
-            AND u.id NOT IN (
-                SELECT user_b_id FROM matches WHERE user_a_id={viewer_db_id}
-                UNION
-                SELECT user_a_id FROM matches WHERE user_b_id={viewer_db_id}
-            )
+        hide_matched = await get_hide_matched()
+        match_clause = ""
+        if hide_matched:
+            match_clause = f"""
+                AND u.id NOT IN (
+                    SELECT user_b_id FROM matches WHERE user_a_id={viewer_db_id}
+                    UNION
+                    SELECT user_a_id FROM matches WHERE user_b_id={viewer_db_id}
+                )
+            """
+
+        query = f"""
+            SELECT u.id FROM users u
+            WHERE u.id != $1
+              AND u.is_active = 1
+              AND u.username IS NOT NULL
+              AND u.photo_file_id IS NOT NULL
+              AND u.tg_id NOT IN (SELECT tg_id FROM blacklist)
+              {gender_clause}
+              {match_clause}
         """
-
-    query = f"""
-        SELECT u.id FROM users u
-        WHERE u.id != ?
-          AND u.is_active = 1
-          AND u.username IS NOT NULL
-          AND u.photo_file_id IS NOT NULL
-          AND u.tg_id NOT IN (SELECT tg_id FROM blacklist)
-          {gender_clause}
-          {match_clause}
-    """
-    rows = await db.execute_fetchall(query, (viewer_db_id,))
-    await db.close()
-    return [r[0] for r in rows]
+        rows = await conn.fetch(query, viewer_db_id)
+    return [r["id"] for r in rows]
 
 
 async def get_next_profile_for_view(viewer_tg_id: int) -> Optional[dict]:
@@ -405,36 +551,35 @@ async def get_next_profile_for_view(viewer_tg_id: int) -> Optional[dict]:
     target_db_id = q.pop(0)
     user_queues[viewer_db_id] = q
 
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        """
-        SELECT id, tg_id, username, age, gender, looking_for, faculty, about, photo_file_id
-        FROM users WHERE id=?
-        """,
-        (target_db_id,),
-    )
-    await db.close()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, tg_id, username, age, gender, looking_for,
+                   faculty, about, photo_file_id
+            FROM users WHERE id=$1
+            """,
+            target_db_id,
+        )
 
-    if not rows:
+    if not row:
         return await get_next_profile_for_view(viewer_tg_id)
 
-    return dict(rows[0])
+    return dict(row)
 
 
 async def get_incoming_likes_count(viewer_tg_id: int) -> int:
     viewer_db_id = await get_user_db_id(viewer_tg_id)
     if viewer_db_id is None:
         return 0
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        """
-        SELECT COUNT(*) FROM swipes
-        WHERE target_id=? AND is_like=1 AND viewed_in_incoming=0
-        """,
-        (viewer_db_id,),
-    )
-    await db.close()
-    return rows[0][0] if rows else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) as cnt FROM swipes
+            WHERE target_id=$1 AND is_like=1 AND viewed_in_incoming=0
+            """,
+            viewer_db_id,
+        )
+    return row["cnt"] if row else 0
 
 
 async def get_one_incoming_like_profile(viewer_tg_id: int) -> Optional[dict]:
@@ -442,143 +587,133 @@ async def get_one_incoming_like_profile(viewer_tg_id: int) -> Optional[dict]:
     if viewer_db_id is None:
         return None
 
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        """
-        SELECT s.id as swipe_id, u.tg_id, u.username, u.age, u.faculty, u.about, u.photo_file_id
-        FROM swipes s
-        JOIN users u ON u.id = s.viewer_id
-        WHERE s.target_id=? AND s.is_like=1 AND s.viewed_in_incoming=0
-        ORDER BY s.created_at ASC
-        LIMIT 1
-        """,
-        (viewer_db_id,),
-    )
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT s.id as swipe_id, u.tg_id, u.username, u.age,
+                   u.faculty, u.about, u.photo_file_id
+            FROM swipes s
+            JOIN users u ON u.id = s.viewer_id
+            WHERE s.target_id=$1 AND s.is_like=1 AND s.viewed_in_incoming=0
+            ORDER BY s.created_at ASC
+            LIMIT 1
+            """,
+            viewer_db_id,
+        )
 
-    if not rows:
-        await db.close()
-        return None
+        if not row:
+            return None
 
-    row = dict(rows[0])
-    swipe_id = row["swipe_id"]
-    await db.execute("UPDATE swipes SET viewed_in_incoming=1 WHERE id=?", (swipe_id,))
-    await db.commit()
-    await db.close()
+        result = dict(row)
+        swipe_id = result["swipe_id"]
+        await conn.execute(
+            "UPDATE swipes SET viewed_in_incoming=1 WHERE id=$1", swipe_id
+        )
 
-    return row
+    return result
 
 
 async def add_like(viewer_tg_id: int, target_tg_id: int) -> bool:
-    db = await get_db()
-    v_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (viewer_tg_id,))
-    t_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (target_tg_id,))
-    if not v_rows or not t_rows:
-        await db.close()
-        return False
-
-    viewer_id = v_rows[0][0]
-    target_id = t_rows[0][0]
-
-    existing = await db.execute_fetchall(
-        "SELECT 1 FROM swipes WHERE viewer_id=? AND target_id=? AND is_like=1",
-        (viewer_id, target_id),
-    )
-    if not existing:
-        await db.execute(
-            "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES (?, ?, 1)",
-            (viewer_id, target_id),
-        )
-        await db.commit()
-
-    mutual_rows = await db.execute_fetchall(
-        "SELECT 1 FROM swipes WHERE viewer_id=? AND target_id=? AND is_like=1 LIMIT 1",
-        (target_id, viewer_id),
-    )
-    mutual = len(mutual_rows) > 0
-
-    if mutual:
-        a, b = min(viewer_id, target_id), max(viewer_id, target_id)
-        existing_match = await db.execute_fetchall(
-            "SELECT 1 FROM matches WHERE user_a_id=? AND user_b_id=?",
-            (a, b),
-        )
-        if existing_match:
-            await db.close()
+    async with pool.acquire() as conn:
+        v_row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", viewer_tg_id)
+        t_row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", target_tg_id)
+        if not v_row or not t_row:
             return False
-        await db.execute(
-            "INSERT OR IGNORE INTO matches (user_a_id, user_b_id) VALUES (?, ?)",
-            (a, b),
-        )
-        await db.commit()
 
-    await db.close()
+        viewer_id = v_row["id"]
+        target_id = t_row["id"]
+
+        existing = await conn.fetchrow(
+            "SELECT 1 FROM swipes WHERE viewer_id=$1 AND target_id=$2 AND is_like=1",
+            viewer_id, target_id,
+        )
+        if not existing:
+            await conn.execute(
+                "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES ($1, $2, 1)",
+                viewer_id, target_id,
+            )
+
+        mutual_row = await conn.fetchrow(
+            "SELECT 1 FROM swipes WHERE viewer_id=$1 AND target_id=$2 AND is_like=1 LIMIT 1",
+            target_id, viewer_id,
+        )
+        mutual = mutual_row is not None
+
+        if mutual:
+            a, b = min(viewer_id, target_id), max(viewer_id, target_id)
+            existing_match = await conn.fetchrow(
+                "SELECT 1 FROM matches WHERE user_a_id=$1 AND user_b_id=$2",
+                a, b,
+            )
+            if existing_match:
+                return False
+            await conn.execute(
+                """
+                INSERT INTO matches (user_a_id, user_b_id) VALUES ($1, $2)
+                ON CONFLICT (user_a_id, user_b_id) DO NOTHING
+                """,
+                a, b,
+            )
+
     return mutual
 
 
 async def add_dislike(viewer_tg_id: int, target_tg_id: int):
-    db = await get_db()
-    v_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (viewer_tg_id,))
-    t_rows = await db.execute_fetchall("SELECT id FROM users WHERE tg_id=?", (target_tg_id,))
-    if not v_rows or not t_rows:
-        await db.close()
-        return
-    await db.execute(
-        "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES (?, ?, 0)",
-        (v_rows[0][0], t_rows[0][0]),
-    )
-    await db.commit()
-    await db.close()
+    async with pool.acquire() as conn:
+        v_row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", viewer_tg_id)
+        t_row = await conn.fetchrow("SELECT id FROM users WHERE tg_id=$1", target_tg_id)
+        if not v_row or not t_row:
+            return
+        await conn.execute(
+            "INSERT INTO swipes (viewer_id, target_id, is_like) VALUES ($1, $2, 0)",
+            v_row["id"], t_row["id"],
+        )
 
 
 async def get_total_likes_for_user(tg_id: int) -> int:
     db_id = await get_user_db_id(tg_id)
     if db_id is None:
         return 0
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        "SELECT COUNT(DISTINCT viewer_id) FROM swipes WHERE target_id=? AND is_like=1",
-        (db_id,),
-    )
-    await db.close()
-    return rows[0][0] if rows else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(DISTINCT viewer_id) as cnt FROM swipes WHERE target_id=$1 AND is_like=1",
+            db_id,
+        )
+    return row["cnt"] if row else 0
 
 
 async def get_top_profiles(limit: int = 10) -> list[dict]:
-    db = await get_db()
-    rows = await db.execute_fetchall(
-        """
-        SELECT u.id, u.tg_id, u.username, u.age, u.faculty,
-               COUNT(DISTINCT s.viewer_id) as likes_count
-        FROM users u
-        LEFT JOIN swipes s ON s.target_id=u.id AND s.is_like=1
-        WHERE u.username IS NOT NULL
-        GROUP BY u.id
-        ORDER BY likes_count DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    await db.close()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.id, u.tg_id, u.username, u.age, u.faculty,
+                   COUNT(DISTINCT s.viewer_id) as likes_count
+            FROM users u
+            LEFT JOIN swipes s ON s.target_id=u.id AND s.is_like=1
+            WHERE u.username IS NOT NULL
+            GROUP BY u.id
+            ORDER BY likes_count DESC
+            LIMIT $1
+            """,
+            limit,
+        )
     return [dict(r) for r in rows]
 
 
 async def get_all_user_tg_ids() -> list[int]:
-    db = await get_db()
-    rows = await db.execute_fetchall("SELECT tg_id FROM users WHERE tg_id IS NOT NULL")
-    await db.close()
-    return [r[0] for r in rows]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT tg_id FROM users WHERE tg_id IS NOT NULL")
+    return [r["tg_id"] for r in rows]
 
 
 # ===================== COMPLAINT HELPER =====================
 
 
 async def send_complaint_to_bot(target_user: dict, complaint_text: str, complainant_username: Optional[str]):
-    """Отправляет жалобу в отдельный бот для жалоб"""
     import aiohttp
 
     complainant_tag = f"@{complainant_username}" if complainant_username else "нет username"
 
-    # Сообщение 1: анкета того, на кого пожаловались
     profile_text = format_profile_text(target_user)
     target_tg_id = target_user.get("tg_id", "?")
     msg1 = (
@@ -587,7 +722,6 @@ async def send_complaint_to_bot(target_user: dict, complaint_text: str, complain
         f"tg_id: <code>{target_tg_id}</code>"
     )
 
-    # Сообщение 2: текст жалобы + кто пожаловался
     msg2 = (
         f"📝 <b>Текст жалобы:</b>\n"
         f"{html_module.escape(complaint_text)}\n\n"
@@ -597,7 +731,6 @@ async def send_complaint_to_bot(target_user: dict, complaint_text: str, complain
     url = f"https://api.telegram.org/bot{COMPLAINT_BOT_TOKEN}/sendMessage"
 
     async with aiohttp.ClientSession() as session:
-        # Отправляем фото анкеты если есть
         photo_id = target_user.get("photo_file_id")
         if photo_id:
             photo_url = f"https://api.telegram.org/bot{COMPLAINT_BOT_TOKEN}/sendPhoto"
@@ -609,7 +742,6 @@ async def send_complaint_to_bot(target_user: dict, complaint_text: str, complain
             }
             async with session.post(photo_url, json=payload_photo) as resp:
                 result = await resp.json()
-                # Если фото не удалось отправить (file_id другого бота), отправляем текстом
                 if not result.get("ok"):
                     payload_text = {
                         "chat_id": COMPLAINT_CHAT_ID,
@@ -627,7 +759,6 @@ async def send_complaint_to_bot(target_user: dict, complaint_text: str, complain
             async with session.post(url, json=payload1) as resp:
                 pass
 
-        # Отправляем текст жалобы
         payload2 = {
             "chat_id": COMPLAINT_CHAT_ID,
             "text": msg2,
@@ -980,7 +1111,7 @@ async def cmd_admin(message: Message, state: FSMContext):
     )
 
 
-# ===================== КНОПКА 2 — ЗАПОЛНИТЬ АНКЕТУ (было 1) =====================
+# ===================== КНОПКА 2 — ЗАПОЛНИТЬ АНКЕТУ =====================
 
 
 @router.message(F.text == "2")
@@ -1356,7 +1487,7 @@ async def donate_author(message: Message, state: FSMContext):
     await show_main_menu(message)
 
 
-# ===================== КНОПКА 1 — СМОТРЕТЬ АНКЕТЫ (было 2) =====================
+# ===================== КНОПКА 1 — СМОТРЕТЬ АНКЕТЫ =====================
 
 
 @router.message(F.text == "1")
@@ -1482,13 +1613,12 @@ async def handle_like(message: Message, state: FSMContext):
     else:
         target_db_id = await get_user_db_id(target_tg_id)
         if target_db_id:
-            db = await get_db()
-            rows = await db.execute_fetchall(
-                "SELECT COUNT(*) FROM swipes WHERE target_id=? AND is_like=1 AND viewed_in_incoming=0",
-                (target_db_id,),
-            )
-            await db.close()
-            count = rows[0][0] if rows else 0
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COUNT(*) as cnt FROM swipes WHERE target_id=$1 AND is_like=1 AND viewed_in_incoming=0",
+                    target_db_id,
+                )
+            count = row["cnt"] if row else 0
 
             if count > 0:
                 word = "человеку" if count == 1 else "людям"
@@ -1546,7 +1676,6 @@ async def handle_complaint_button(message: Message, state: FSMContext):
         )
         return
 
-    # Сохраняем target в state для жалобы
     await state.update_data(complaint_target_tg_id=target_tg_id)
 
     await send_with_custom_kb(
@@ -1558,10 +1687,8 @@ async def handle_complaint_button(message: Message, state: FSMContext):
 
 @router.message(F.text == "Назад")
 async def handle_complaint_back(message: Message, state: FSMContext):
-    """Возврат назад к просмотру анкет из меню жалобы"""
     current_state = await state.get_state()
 
-    # Если мы в состоянии жалобы — очищаем
     if current_state == ComplaintForm.waiting_text.state:
         await state.clear()
 
@@ -1569,13 +1696,11 @@ async def handle_complaint_back(message: Message, state: FSMContext):
     target_tg_id = current_targets.get(user_tg_id)
 
     if target_tg_id:
-        # Показываем ту же анкету заново
         target_user = await get_user_by_tg_id(target_tg_id)
         if target_user:
             await send_profile_card(message.chat.id, target_user, browse_kb())
             return
 
-    # Если не получилось — показываем следующую
     await show_random_profile(message)
 
 
@@ -1620,11 +1745,9 @@ async def handle_complaint_text(message: Message, state: FSMContext):
         await show_main_menu(message)
         return
 
-    # Получаем данные того, на кого жалуются
     target_user = await get_user_by_tg_id(target_tg_id)
     complainant_username = message.from_user.username
 
-    # Отправляем жалобу в бот для жалоб
     try:
         await send_complaint_to_bot(target_user, complaint_text, complainant_username)
     except Exception as e:
@@ -1632,7 +1755,6 @@ async def handle_complaint_text(message: Message, state: FSMContext):
 
     await message.answer("✅ <b>Ваша жалоба отправлена и будет рассмотрена. Спасибо!</b>")
 
-    # Возвращаем к просмотру анкет
     incoming = await get_incoming_likes_count(message.from_user.id)
     if incoming > 0:
         await show_incoming_like_profile(message)
@@ -1908,9 +2030,23 @@ async def fallback(message: Message, state: FSMContext):
 # ===================== MAIN =====================
 
 
-async def main():
+async def on_startup():
+    await create_pool()
     await init_db()
+    await migrate_from_sqlite()
     logger.info("Bot started")
+
+
+async def on_shutdown():
+    global pool
+    if pool:
+        await pool.close()
+        logger.info("PostgreSQL pool closed")
+
+
+async def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)
 
 
