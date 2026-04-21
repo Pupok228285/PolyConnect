@@ -61,9 +61,6 @@ main_bot = telebot.TeleBot(API_TOKEN)
 helper_bot = telebot.TeleBot(COMPLAINT_BOT_TOKEN)
 
 # ===================== PREMIUM EMOJI IDS =====================
-sw_created = r.get("created_at")
-if isinstance(sw_created, str):
-    sw_created = datetime.fromisoformat(sw_created)
 
 EMOJI_SETTINGS = "5870982283724328568"
 EMOJI_PROFILE = "5870994129244131212"
@@ -285,16 +282,21 @@ async def migrate_from_sqlite():
             r = dict(r)
             new_viewer = id_map.get(r.get("viewer_id"))
             new_target = id_map.get(r.get("target_id"))
+
             if new_viewer is None or new_target is None:
                 continue
+
+            # МЫ ПРОСТО ВСТАВЛЯЕМ ДАННЫЕ, А ДАТУ ПУСТЬ СТАВИТ БАЗА ЧЕРЕЗ NOW()
             await conn.execute(
                 """
                 INSERT INTO swipes (viewer_id, target_id, is_like,
-                                    viewed_in_incoming, created_at)
-                VALUES ($1,$2,$3,$4,$5)
+                                   viewed_in_incoming, created_at)
+                VALUES ($1, $2, $3, $4, NOW())
                 """,
-                new_viewer, new_target, r.get("is_like", 0),
-                r.get("viewed_in_incoming", 0), r.get("created_at"),
+                new_viewer,
+                new_target,
+                r.get("is_like", 0),
+                r.get("viewed_in_incoming", 0)
             )
             migrated_swipes += 1
         logger.info(f"Migrated {migrated_swipes} swipes")
