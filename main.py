@@ -56,9 +56,9 @@ HIDE_MATCHED_PROFILES = True
 
 # === LIKE MESSAGE === Управление доступом
 # Вписывай сюда Telegram ID пользователей, которым доступна кнопка 💌
-ALLOWED_SENDER_IDS: list[int] = [1056843400]
+ALLOWED_SENDER_IDS: list[int] = []
 # Если True — кнопка 💌 доступна ВСЕМ пользователям
-ALLOW_MESSAGES_FOR_ALL: bool = False
+ALLOW_MESSAGES_FOR_ALL: bool = True
 
 # ===================== БОТ ДЛЯ ЖАЛОБ =====================
 COMPLAINT_CHAT_ID = 1056843400
