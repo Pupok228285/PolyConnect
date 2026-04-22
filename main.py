@@ -54,6 +54,12 @@ ADMIN_IDS = {1056843400, 5002429263}
 SUPPORT_USERNAME = "@hekomar"
 HIDE_MATCHED_PROFILES = True
 
+# === LIKE MESSAGE === Управление доступом
+# Вписывай сюда Telegram ID пользователей, которым доступна кнопка 💌
+ALLOWED_SENDER_IDS: list[int] = []
+# Если True — кнопка 💌 доступна ВСЕМ пользователям
+ALLOW_MESSAGES_FOR_ALL: bool = False
+
 # ===================== БОТ ДЛЯ ЖАЛОБ =====================
 COMPLAINT_CHAT_ID = 1056843400
 
@@ -131,6 +137,11 @@ class BlacklistForm(StatesGroup):
 
 class ComplaintForm(StatesGroup):
     waiting_text = State()
+
+
+# === LIKE MESSAGE === Новое состояние для ожидания сообщения к лайку
+class UserStates(StatesGroup):
+    waiting_for_like_message = State()
 
 
 # ===================== IN-MEMORY STORES =====================
@@ -211,6 +222,18 @@ async def init_db():
                 value TEXT
             );
         """)
+        # === LIKE MESSAGE === Таблица для хранения сообщений к лайкам
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS like_messages (
+                id SERIAL PRIMARY KEY,
+                sender_tg_id BIGINT NOT NULL,
+                target_tg_id BIGINT NOT NULL,
+                content_type TEXT NOT NULL,
+                file_id TEXT,
+                text_content TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
         row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", "hide_matched")
         if row is None:
             await conn.execute(
@@ -256,7 +279,6 @@ async def migrate_from_sqlite():
                 r.get("photo_file_id"), r.get("gender"), r.get("age"),
                 r.get("faculty"), r.get("about"), r.get("is_active"),
                 r.get("looking_for")
-                # Заметь: r.get("created_at") и r.get("updated_at") здесь больше НЕ НУЖНЫ
             )
     logger.info(f"Migrated {len(rows)} users with current timestamp")
 
@@ -286,7 +308,6 @@ async def migrate_from_sqlite():
             if new_viewer is None or new_target is None:
                 continue
 
-            # МЫ ПРОСТО ВСТАВЛЯЕМ ДАННЫЕ, А ДАТУ ПУСТЬ СТАВИТ БАЗА ЧЕРЕЗ NOW()
             await conn.execute(
                 """
                 INSERT INTO swipes (viewer_id, target_id, is_like,
@@ -807,7 +828,15 @@ def my_profile_menu_kb() -> dict:
     }
 
 
-def browse_kb() -> dict:
+# === LIKE MESSAGE === Клавиатура просмотра анкет с кнопкой 💌 (для разрешённых пользователей)
+def browse_kb(show_message_button: bool = False) -> dict:
+    if show_message_button:
+        return {
+            "keyboard": [
+                [{"text": "❤️"}, {"text": "💌"}, {"text": "👎"}, {"text": "⚠️"}, {"text": "💤"}],
+            ],
+            "resize_keyboard": True,
+        }
     return {
         "keyboard": [
             [{"text": "❤️"}, {"text": "👎"}, {"text": "⚠️"}, {"text": "💤"}],
@@ -926,6 +955,13 @@ async def send_photo_with_custom_kb(chat_id: int, photo: str, caption: str, keyb
 
 
 # ===================== HELPERS =====================
+
+
+# === LIKE MESSAGE === Проверка, доступна ли кнопка 💌 пользователю
+def can_send_like_message(tg_id: int) -> bool:
+    if ALLOW_MESSAGES_FOR_ALL:
+        return True
+    return tg_id in ALLOWED_SENDER_IDS
 
 
 def get_clickable_username(user: dict) -> str:
@@ -1537,7 +1573,9 @@ async def show_random_profile(message: Message):
         return
 
     current_targets[message.from_user.id] = profile["tg_id"]
-    await send_profile_card(message.chat.id, profile, browse_kb())
+    # === LIKE MESSAGE === Показываем кнопку 💌 если у пользователя есть доступ
+    show_msg_btn = can_send_like_message(message.from_user.id)
+    await send_profile_card(message.chat.id, profile, browse_kb(show_message_button=show_msg_btn))
 
 
 async def show_incoming_like_profile(message: Message):
@@ -1569,6 +1607,389 @@ async def view_incoming_likes(message: Message, state: FSMContext):
         return
     await state.clear()
     await show_incoming_like_profile(message)
+
+
+# ===================== 💌 СООБЩЕНИЕ К ЛАЙКУ (LIKE MESSAGE) =====================
+
+
+@router.message(F.text == "💌")
+async def handle_like_message_button(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик кнопки 💌 — переводит пользователя в режим ввода сообщения к анкете.
+    """
+    if await check_blacklist(message):
+        return
+
+    user_tg_id = message.from_user.id
+
+    # Проверка доступа
+    if not can_send_like_message(user_tg_id):
+        await message.answer("❌ Эта функция пока недоступна.")
+        return
+
+    target_tg_id = current_targets.get(user_tg_id)
+    if target_tg_id is None:
+        await message.answer(
+            "❌ Не могу понять, кому отправить сообщение. Нажми <b>1</b> чтобы смотреть анкеты."
+        )
+        return
+
+    # Сохраняем target_tg_id в FSM и переводим в состояние ожидания сообщения
+    await state.update_data(like_message_target_tg_id=target_tg_id)
+    await state.set_state(UserStates.waiting_for_like_message)
+
+    await message.answer(
+        "💌 <b>Отправь сообщение, которое получит этот человек вместе с твоей анкетой.</b>\n\n"
+        "Можно отправить: текст, фото, видео или кружок (видеосообщение).\n\n"
+        "Для отмены отправь /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("cancel"), UserStates.waiting_for_like_message)
+async def cancel_like_message(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Отмена ввода сообщения к лайку — возвращаем обратно к анкете.
+    """
+    data = await state.get_data()
+    target_tg_id = data.get("like_message_target_tg_id")
+    await state.clear()
+
+    if target_tg_id:
+        # Восстанавливаем current_target, чтобы пользователь мог продолжить листать
+        current_targets[message.from_user.id] = target_tg_id
+        target_user = await get_user_by_tg_id(target_tg_id)
+        if target_user:
+            show_msg_btn = can_send_like_message(message.from_user.id)
+            await send_profile_card(message.chat.id, target_user, browse_kb(show_message_button=show_msg_btn))
+            return
+
+    await show_random_profile(message)
+
+
+@router.message(
+    UserStates.waiting_for_like_message,
+    F.content_type.in_({ContentType.TEXT, ContentType.PHOTO, ContentType.VIDEO, ContentType.VIDEO_NOTE})
+)
+async def process_like_message(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Принимает сообщение (текст/фото/видео/кружок), записывает лайк,
+    отправляет целевому пользователю сообщение + анкету отправителя с кнопками ❤️/💔.
+    """
+    if await check_blacklist(message):
+        return
+
+    data = await state.get_data()
+    target_tg_id = data.get("like_message_target_tg_id")
+    await state.clear()
+
+    user_tg_id = message.from_user.id
+
+    if not target_tg_id:
+        await message.answer("❌ Ошибка. Попробуй заново.")
+        await show_main_menu(message)
+        return
+
+    # Определяем тип контента и file_id
+    content_type = message.content_type
+    file_id = None
+    text_content = None
+
+    if content_type == ContentType.TEXT:
+        text_content = message.text
+    elif content_type == ContentType.PHOTO:
+        file_id = message.photo[-1].file_id
+        text_content = message.caption  # может быть None
+    elif content_type == ContentType.VIDEO:
+        file_id = message.video.file_id
+        text_content = message.caption
+    elif content_type == ContentType.VIDEO_NOTE:
+        file_id = message.video_note.file_id
+
+    # Сохраняем сообщение в БД
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO like_messages (sender_tg_id, target_tg_id, content_type, file_id, text_content, created_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            """,
+            user_tg_id, target_tg_id, content_type, file_id, text_content,
+        )
+
+    # Записываем лайк (как обычный)
+    mutual = await add_like(user_tg_id, target_tg_id)
+
+    if mutual:
+        # === Если уже взаимный лайк — сразу матч, как в обычном handle_like ===
+        user_a = await get_user_by_tg_id(user_tg_id)
+        user_b = await get_user_by_tg_id(target_tg_id)
+
+        link_a = get_clickable_username(user_a) if user_a else "?"
+        link_b = get_clickable_username(user_b) if user_b else "?"
+
+        # Уведомляем отправителя
+        await message.answer(
+            f"🎉 <b>У вас взаимная симпатия!</b>\n\n"
+            f"Лови ссылку: {link_b}\n\n"
+            f"<i>Сообщение было доставлено. Чтобы продолжить — нажми 1.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # Уведомляем получателя
+        try:
+            # Сначала отправляем сообщение от отправителя
+            await bot.send_message(
+                target_tg_id,
+                "💌 <b>Тебе прислали сообщение к анкете!</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            # Отправляем само медиа/текст
+            await _send_like_media_to_target(target_tg_id, content_type, file_id, text_content)
+
+            # Отправляем уведомление о мэтче
+            await bot.send_message(
+                target_tg_id,
+                f"🎉 <b>У вас взаимная симпатия!</b>\n"
+                f"Напиши: {link_a}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify target {target_tg_id} about mutual match with message: {e}")
+
+        # Показываем главное меню отправителю
+        await show_main_menu(message)
+        return
+
+    # === Лайк НЕ взаимный — отправляем получателю сообщение + анкету отправителя с InlineKeyboard ===
+    sender_user = await get_user_by_tg_id(user_tg_id)
+
+    try:
+        # 1) Заголовок
+        await bot.send_message(
+            target_tg_id,
+            "💌 <b>Тебе прислали сообщение к анкете!</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+        # 2) Само сообщение пользователя
+        await _send_like_media_to_target(target_tg_id, content_type, file_id, text_content)
+
+        # 3) Анкета отправителя с inline-кнопками ❤️ и 💔
+        if sender_user:
+            profile_text = format_profile_text(sender_user)
+            # Inline-кнопки: like_msg_SENDER_TG_ID  /  dislike_msg_SENDER_TG_ID
+            inline_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="❤️", callback_data=f"like_msg_{user_tg_id}"),
+                        InlineKeyboardButton(text="💔", callback_data=f"dislike_msg_{user_tg_id}"),
+                    ]
+                ]
+            )
+            photo_id = sender_user.get("photo_file_id")
+            if photo_id:
+                await bot.send_photo(
+                    target_tg_id,
+                    photo=photo_id,
+                    caption=profile_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=inline_kb,
+                )
+            else:
+                await bot.send_message(
+                    target_tg_id,
+                    profile_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=inline_kb,
+                )
+
+    except Exception as e:
+        logger.error(f"Failed to send like message to {target_tg_id}: {e}")
+
+    # Подтверждаем отправителю
+    await message.answer("✅ <b>Сообщение отправлено!</b> Продолжаем листать анкеты...")
+
+    # Показываем следующую анкету
+    incoming = await get_incoming_likes_count(user_tg_id)
+    if incoming > 0:
+        await show_incoming_like_profile(message)
+    else:
+        await show_random_profile(message)
+
+
+@router.message(UserStates.waiting_for_like_message)
+async def process_like_message_invalid(message: Message, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Если пользователь отправил неподдерживаемый тип контента.
+    """
+    await message.answer(
+        "❌ Отправь <b>текст</b>, <b>фото</b>, <b>видео</b> или <b>кружок</b>.\n"
+        "Для отмены: /cancel"
+    )
+
+
+# === LIKE MESSAGE === Хелпер для отправки медиа получателю
+async def _send_like_media_to_target(target_tg_id: int, content_type: str, file_id: Optional[str], text_content: Optional[str]):
+    """Отправляет само медиа-сообщение (текст/фото/видео/кружок) получателю."""
+    try:
+        if content_type == ContentType.TEXT and text_content:
+            await bot.send_message(
+                target_tg_id,
+                f"💬 {html_module.escape(text_content)}",
+                parse_mode=ParseMode.HTML,
+            )
+        elif content_type == ContentType.PHOTO and file_id:
+            if text_content:
+                await bot.send_photo(
+                    target_tg_id,
+                    photo=file_id,
+                    caption=f"💬 {html_module.escape(text_content)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await bot.send_photo(target_tg_id, photo=file_id)
+        elif content_type == ContentType.VIDEO and file_id:
+            if text_content:
+                await bot.send_video(
+                    target_tg_id,
+                    video=file_id,
+                    caption=f"💬 {html_module.escape(text_content)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await bot.send_video(target_tg_id, video=file_id)
+        elif content_type == ContentType.VIDEO_NOTE and file_id:
+            await bot.send_video_note(target_tg_id, video_note=file_id)
+    except Exception as e:
+        logger.error(f"Failed to send like media to {target_tg_id}: {e}")
+
+
+# === LIKE MESSAGE === Inline callback: ❤️ ответный лайк на сообщение с анкетой
+@router.callback_query(F.data.startswith("like_msg_"))
+async def handle_like_msg_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик нажатия ❤️ под анкетой, пришедшей вместе с сообщением.
+    Засчитывает ответный лайк. Если мэтч — выдаёт контакты обоим.
+    """
+    await callback.answer()
+
+    target_tg_id = callback.from_user.id  # тот, кто нажал ❤️ (получатель сообщения)
+    sender_tg_id_str = callback.data.replace("like_msg_", "")
+
+    try:
+        sender_tg_id = int(sender_tg_id_str)
+    except ValueError:
+        return
+
+    # Записываем ответный лайк
+    mutual = await add_like(target_tg_id, sender_tg_id)
+
+    if mutual:
+        user_a = await get_user_by_tg_id(target_tg_id)
+        user_b = await get_user_by_tg_id(sender_tg_id)
+
+        link_a = get_clickable_username(user_a) if user_a else "?"
+        link_b = get_clickable_username(user_b) if user_b else "?"
+
+        # Уведомляем получателя (кто нажал ❤️)
+        try:
+            await bot.send_message(
+                target_tg_id,
+                f"🎉 <b>У вас взаимная симпатия!</b>\n\n"
+                f"Напиши: {link_b}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify {target_tg_id} about match: {e}")
+
+        # Уведомляем отправителя (кто отправлял 💌)
+        try:
+            await bot.send_message(
+                sender_tg_id,
+                f"🎉 <b>У вас взаимная симпатия!</b>\n"
+                f"Твоё сообщение понравилось! Напиши: {link_a}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify sender {sender_tg_id} about match: {e}")
+    else:
+        # Не мэтч (лайк уже был, или первый ответный) — уведомим что лайк засчитан
+        try:
+            await bot.send_message(
+                target_tg_id,
+                "❤️ <b>Лайк отправлен!</b> Если симпатия взаимная — вы получите контакты друг друга.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        # Уведомляем отправителя о входящем лайке
+        sender_db_id = await get_user_db_id(sender_tg_id)
+        if sender_db_id:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COUNT(*) as cnt FROM swipes WHERE target_id=$1 AND is_like=1 AND viewed_in_incoming=0",
+                    sender_db_id,
+                )
+            count = row["cnt"] if row else 0
+            if count > 0:
+                word = "человеку" if count == 1 else "людям"
+                try:
+                    await send_with_custom_kb(
+                        sender_tg_id,
+                        f"❤️ Ты понравился <b>{count}</b> {word}!",
+                        view_likes_kb(),
+                    )
+                except Exception:
+                    pass
+
+    # Убираем inline-кнопки с сообщения
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# === LIKE MESSAGE === Inline callback: 💔 ответный дизлайк на сообщение с анкетой
+@router.callback_query(F.data.startswith("dislike_msg_"))
+async def handle_dislike_msg_callback(callback: CallbackQuery, state: FSMContext):
+    """
+    === LIKE MESSAGE ===
+    Обработчик нажатия 💔 под анкетой, пришедшей вместе с сообщением.
+    Засчитывает дизлайк.
+    """
+    await callback.answer()
+
+    target_tg_id = callback.from_user.id  # тот, кто нажал 💔
+    sender_tg_id_str = callback.data.replace("dislike_msg_", "")
+
+    try:
+        sender_tg_id = int(sender_tg_id_str)
+    except ValueError:
+        return
+
+    # Записываем дизлайк
+    await add_dislike(target_tg_id, sender_tg_id)
+
+    try:
+        await bot.send_message(
+            target_tg_id,
+            "👎 <b>Анкета пропущена.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Убираем inline-кнопки
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # ===================== ❤️ ЛАЙК =====================
@@ -1617,8 +2038,6 @@ async def handle_like(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        # ВАЖНО: Мы делаем return, чтобы бот НЕ присылал новую анкету мгновенно.
-        # Это даст пользователю возможность кликнуть по ссылке.
         return
 
     else:
@@ -1711,7 +2130,8 @@ async def handle_complaint_back(message: Message, state: FSMContext):
     if target_tg_id:
         target_user = await get_user_by_tg_id(target_tg_id)
         if target_user:
-            await send_profile_card(message.chat.id, target_user, browse_kb())
+            show_msg_btn = can_send_like_message(message.from_user.id)
+            await send_profile_card(message.chat.id, target_user, browse_kb(show_message_button=show_msg_btn))
             return
 
     await show_random_profile(message)
