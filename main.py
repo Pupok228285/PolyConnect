@@ -1588,6 +1588,7 @@ async def handle_like(message: Message, state: FSMContext):
         )
         return
 
+    # Записываем лайк и проверяем на взаимность
     mutual = await add_like(user_tg_id, target_tg_id)
 
     if mutual:
@@ -1597,16 +1598,15 @@ async def handle_like(message: Message, state: FSMContext):
         link_a = get_clickable_username(user_a) if user_a else "?"
         link_b = get_clickable_username(user_b) if user_b else "?"
 
-        try:
-            await bot.send_message(
-                user_tg_id,
-                f"🎉 <b>У вас взаимная симпатия!</b>\n"
-                f"Напиши: {link_b}",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        # Отправляем сообщение ТЕБЕ (сразу даем ссылку)
+        await message.answer(
+            f"🎉 <b>У вас взаимная симпатия!</b>\n\n"
+            f"Лови ссылку: {link_b}\n\n"
+            f"<i>Чтобы продолжить смотреть анкеты, нажми ❤️ еще раз.</i>",
+            parse_mode=ParseMode.HTML,
+        )
 
+        # Уведомляем ТОГО человека
         try:
             await bot.send_message(
                 target_tg_id,
@@ -1617,7 +1617,12 @@ async def handle_like(message: Message, state: FSMContext):
         except Exception:
             pass
 
+        # ВАЖНО: Мы делаем return, чтобы бот НЕ присылал новую анкету мгновенно.
+        # Это даст пользователю возможность кликнуть по ссылке.
+        return
+
     else:
+        # Если лайк НЕ взаимный (просто уведомляем цель, если нужно)
         target_db_id = await get_user_db_id(target_tg_id)
         if target_db_id:
             async with pool.acquire() as conn:
@@ -1638,6 +1643,7 @@ async def handle_like(message: Message, state: FSMContext):
                 except Exception:
                     pass
 
+    # Если матча не было — листаем дальше автоматически
     incoming = await get_incoming_likes_count(user_tg_id)
     if incoming > 0:
         await show_incoming_like_profile(message)
