@@ -4,3 +4,4 @@ aiosqlite
 python-dotenv
 aiohttp
 asyncpg
+apscheduler
