@@ -1575,7 +1575,7 @@ async def process_story_question(message: Message, state: FSMContext):
 
     from datetime import date, timedelta
     today = date.today()
-    day_of_week = 1  # 0=Пн, 1=Вт, ...
+    day_of_week = today.weekday()  # 0=Пн, 1=Вт, ...
     week_start = today - timedelta(days=day_of_week)
 
     async with pool.acquire() as conn:
