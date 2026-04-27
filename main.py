@@ -64,7 +64,7 @@ ALLOWED_SENDER_IDS: list[int] = []
 ALLOW_MESSAGES_FOR_ALL: bool = True
 
 # ===================== КОНФИГУРАЦИЯ ТЕСТИРОВАНИЯ =====================
-ALLOW_NETWORKING_ALL = False   # Если False — гео-нетворкинг только для TESTER_IDS
+ALLOW_NETWORKING_ALL = True   # Если False — гео-нетворкинг только для TESTER_IDS
 ALLOW_STORY_ALL = False        # Если False — «Бочка» только для TESTER_IDS
 TESTER_IDS = [1056843400, 5002429263, 1097274747]  # ID тестировщиков
 REVEAL_STORIES = False         # Глобальный флаг для открытия ответов в "Бочке"
